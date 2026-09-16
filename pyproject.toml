@@ -1,0 +1,11 @@
+[project]
+name = "codex-thread-doctor"
+version = "0.1.0"
+description = "Diagnose and repair broken Codex session threads (model blocks, broken call ids, corrupted compaction checkpoints)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+[tool.pytest.ini_options]
+pythonpath = ["scripts", "tests"]
+testpaths = ["tests"]

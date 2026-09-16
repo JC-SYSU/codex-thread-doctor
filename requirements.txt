@@ -1,0 +1,3 @@
+# Runtime: none — the toolkit is stdlib-only Python >= 3.11.
+# Test-only dependency:
+pytest>=8.0
