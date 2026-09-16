@@ -42,8 +42,10 @@ def sha256(data: bytes) -> str:
 
 
 def utc_stamp() -> str:
-    """UTC timestamp safe for filenames, e.g. 20260916T143000Z."""
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    """UTC timestamp with microseconds, safe for filenames and unique within
+    a second (e.g. 20260916T153012123456Z) so a re-run never overwrites the
+    previous backup."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def codex_home() -> Path:
@@ -99,6 +101,11 @@ def atomic_write(path: Path, data: bytes, mode: int | None = None) -> None:
     is cleaned up on any failure so no partial outputs survive.
     """
     path = Path(path)
+    if path.is_symlink():
+        raise ValueError(
+            f"refusing to replace symlink in place: {path} "
+            "(resolve it first or the link itself gets destroyed)"
+        )
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     tmp = Path(tmp_name)
     try:
@@ -228,6 +235,15 @@ def repair_empty_call_ids(
     stats = {"calls": 0, "outputs": 0, "auto_assigned": 0, "unmatched_outputs": 0}
     seen: dict[str, set[str]] = {t: set() for t in CALL_TYPES}
     pending: dict[str, list[str]] = {t: [] for t in CALL_TYPES}
+    # call ids already consumed by a non-empty output that appeared before
+    # its call; they must never be handed out again by FIFO. Keyed by the
+    # OUTPUT type (the type the claims arrive as).
+    claimed: dict[str, set[str]] = {v: set() for v in CALL_TYPES.values()}
+    for row in rows:
+        payload = row.get("payload") or {}
+        for out_t in CALL_TYPES.values():
+            if payload.get("type") == out_t and payload.get("call_id"):
+                claimed[out_t].add(payload["call_id"])
 
     for ln, row in enumerate(rows, 1):
         payload = row.get("payload") or {}
@@ -246,6 +262,11 @@ def repair_empty_call_ids(
                     cid = payload.get("id") or None
                     if not cid:
                         cid = f"call_repaired_{t}_{ln}"
+                    elif cid in seen[t]:
+                        # Inherited id collides with an earlier call: the
+                        # promise is uniqueness, not inheritance.
+                        cid = f"call_repaired_{t}_{ln}"
+                        stats["auto_assigned"] += 1
                     payload["call_id"] = cid
                     seen[t].add(cid)
                     stats["auto_assigned"] += 1
@@ -254,14 +275,15 @@ def repair_empty_call_ids(
                 stats["outputs"] += 1
                 cid = payload.get("call_id")
                 if cid:
-                    # Cross-validate the referent exists; mismatch stays for
-                    # the caller to judge, only empty ids are auto-repaired.
                     if cid in seen[t]:
                         try:
                             pending[t].remove(cid)
                         except ValueError:
                             pass
                 else:
+                    # Never repurpose an id an earlier output already owns.
+                    while pending[t] and pending[t][0] in claimed[out_t]:
+                        pending[t].pop(0)
                     if pending[t]:
                         payload["call_id"] = pending[t].pop(0)
                         stats["auto_assigned"] += 1
@@ -273,10 +295,11 @@ def repair_empty_call_ids(
 # --------------------------------------------------------------- compaction
 
 def is_compaction(row: dict) -> bool:
+    """Compaction records and their completion events, by type field only —
+    never by searching serialized text, so user messages can't false-positive."""
     return (
         row.get("type") == "compacted"
         or (row.get("event_msg", {}).get("type") == "context_compacted")
-        or ("compaction.summary" in json.dumps(row))
     )
 
 

@@ -6,8 +6,9 @@ computes machine-state health indicators, and — with --shadow-test — actuall
 resumes the at-risk candidates in temporary shadow CODEX_HOME copies.
 
 Read-only by design: original files are only ever opened for reading; shadow
-tests write only to temp directories; the hash guard fails the run if any
-original session file changed underneath the audit.
+tests write only to temp directories (each verification's run log lands in
+the backup directory, not in the session tree); the hash guard fails the run
+if any original session file changed underneath the audit.
 
 Indicators per session (all computed from machine state fields, never from
 conversation text):
@@ -215,6 +216,10 @@ def main() -> None:
 
     home = lib.codex_home()
     files = collect_all(home, args.session)
+    if args.session and not files:
+        print(f"error: no session file found for {args.session} under {home}",
+              file=sys.stderr)
+        sys.exit(2)
     blocked = set(args.blocked_model)
     result = audit(home, files, blocked)
 

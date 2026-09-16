@@ -121,6 +121,47 @@ def test_compaction_pair_counts():
     assert not lib.is_compaction(rows[2])
 
 
+def test_is_compaction_ignores_message_text():
+    """M1 regression: a user message mentioning compaction.summary must never
+    be treated as a compaction record."""
+    from conftest import user_message
+
+    msg = user_message("why does compaction.summary show a mismatch?")
+    assert not lib.is_compaction(msg)
+    assert lib.is_compaction(compacted("c1", "t1", [{"checkpoint_id": "c1"}]))
+    assert lib.is_compaction(context_compacted("t1", "c1"))
+
+
+def test_inherited_id_collision_gets_repaired():
+    """H1 regression: an empty call_id inheriting an id that a previous call
+    already used must be rewritten, not left duplicated."""
+    rows = [
+        function_call("x", tool_call_id="id-a"),
+        function_call(None, tool_call_id="x"),  # inherits id "x" — collision
+        function_call_output("x"),
+    ]
+    rows, stats = lib.repair_empty_call_ids(rows)
+    cids = [r["payload"]["call_id"] for r in rows]
+    assert cids[0] == "x"
+    assert cids[1].startswith("call_repaired_") and cids[1] != "x"
+    assert len(set(cids[:2])) == 2  # unique
+    assert stats["unmatched_outputs"] == 0
+
+
+def test_output_claimed_id_never_reused():
+    """H2 regression: an id already claimed by an earlier output must not be
+    handed out again by FIFO to a later empty output."""
+    rows = [
+        function_call_output("z"),   # claims 'z' before its call exists
+        function_call("z"),
+        function_call_output(None),  # must NOT receive 'z'
+    ]
+    rows, stats = lib.repair_empty_call_ids(rows)
+    cids = [r["payload"]["call_id"] for r in rows]
+    assert cids[0] == "z" and cids[1] == "z" and cids[2] is None
+    assert stats["unmatched_outputs"] == 1  # the orphan output stays honest
+
+
 def test_dedupe_index():
     blob = (
         json.dumps({"id": SID, "updated_at": "a"}) + "\n"

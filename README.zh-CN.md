@@ -70,7 +70,7 @@ python3 scripts/doctor_verify.py --session-id <thread-id>
 
 ## 数据与安全
 
-修复流程：读会话 JSONL → 在旁边写备份 → 原子替换文件。撤销任何修复：`doctor_fix.py restore --backup <file> --target <file>`，或整个删掉备份目录。影子验证只写退出时自动清理的临时目录。audit 和 verify 对真实 home 全程只读，可随时重跑。
+修复流程：读会话 JSONL → 在 `~/.codex/.thread-doctor-backups/` 写校验过的备份 → 原子替换文件。撤销任何修复：`doctor_fix.py restore --backup <file> --target <file>`，或整个删掉备份目录。影子验证只写退出时自动清理的临时目录（运行日志落在备份目录里）。audit 和 verify 对真实 home 全程只读，可随时重跑。
 
 agent 安装完后（INSTALL.md 第 5 节）逐一确认脚本报 0 errors、测试通过。Codex CLI 是外部依赖：`doctor_verify.py` 需要 PATH 里有 `codex` 二进制（macOS 上也会探测 ChatGPT.app 自带的）。
 

@@ -56,10 +56,14 @@ ERROR_SIGNATURES = (
     ("encrypted_content", "invalid_encrypted_content"),
     ("encrypted_content", "could not be decrypted"),
     ("encrypted_content", "could not be verified"),
-    ("compaction_hint", "compaction failed"),
-    ("compaction_hint", "invalid paginated history"),
+    ("compaction_failed", "compaction failed"),
+)
+# Reported as evidence only; a hit alone never changes the verdict.
+INFO_SIGNATURES = (
+    ("paginated_history", "invalid paginated history"),
     ("http_400", "400"),
 )
+CRITICAL_LABELS = {label for label, _ in ERROR_SIGNATURES}
 
 
 class VerdictError(Exception):
@@ -100,7 +104,7 @@ def build_shadow_home(home: Path, session_id: str, session_file: Path) -> Path:
 
 def classify(output: str) -> dict:
     hits: dict[str, str] = {}
-    for label, sig in ERROR_SIGNATURES:
+    for label, sig in ERROR_SIGNATURES + INFO_SIGNATURES:
         if sig in output:
             hits.setdefault(label, sig)
     return hits
@@ -133,8 +137,7 @@ def run_verify(
         "archive": session_file.as_posix().find("archived_sessions") != -1,
         "rc": None,
         "timed_out": False,
-        "response_ok": False,
-        "signatures": {},
+        "signature_hits": {},
         "sha256_before": None,
         "sha256_after": None,
         "hash_guard": None,
@@ -165,7 +168,8 @@ def run_verify(
     result["rc"] = run["rc"]
     result["timed_out"] = run["timed_out"]
     output = run["output"]
-    result["signature_hits"] = classify(output)
+    hits = classify(output)
+    result["signature_hits"] = hits
     result["response_contains_marker"] = marker in output
 
     if mode == "shadow" and not result["hash_guard"]:
@@ -178,13 +182,18 @@ def run_verify(
         result["verdict"] = "model_blocked"
     elif marker not in output:
         result["verdict"] = "marker_missing"
+    elif hits.keys() & CRITICAL_LABELS:
+        result["verdict"] = "signature_present"
     else:
         result["verdict"] = "ok"
 
     result["healthy"] = result["verdict"] == "ok"
-    # Persist a copy of the run log next to the session's backups.
+    # Persist a copy of the run log next to the session's backups. The
+    # session id is user input — strip path separators before it touches a
+    # filename.
+    safe_id = session_id.replace("/", "_").replace("\\", "_")
     backup_dir.mkdir(parents=True, exist_ok=True)
-    (backup_dir / f"verify-{session_id}.log").write_text(output, encoding="utf-8")
+    (backup_dir / f"verify-{safe_id}.log").write_text(output, encoding="utf-8")
     return result
 
 

@@ -127,6 +127,65 @@ def test_remove_compaction_keeps_balance(home: Path):
     assert c == 0 and e == 0
 
 
+def test_remove_compaction_matches_event_by_checkpoint_id(tmp_path, monkeypatch):
+    """H3 regression: the paired event may carry a later timestamp than the
+    compacted record; matching must use the checkpoint id, not the seconds."""
+    from conftest import compacted, context_compacted, encode_session, session_meta, SID
+
+    home = tmp_path / "h3"
+    (home / "sessions" / "2026" / "01" / "01").mkdir(parents=True)
+    path = home / "sessions" / "2026" / "01" / "01" / f"rollout-x-{SID}.jsonl"
+    rows = [
+        session_meta(),
+        compacted("c_bad", "2026-01-01T00:00:00Z",
+                  [{"checkpoint_id": "c_bad", "timestamp": "2026-01-01T00:00:00Z"}]),
+        context_compacted("2026-01-01T00:05:17Z", "c_bad"),  # 5 min later
+    ]
+    path.write_bytes(encode_session(rows))
+    monkeypatch.setenv("CODEX_HOME", str(home))
+
+    doctor_fix.cmd_remove_compaction(make_args(checkpoint=["c_bad"]))
+    text = path.read_text(encoding="utf-8")
+    assert "c_bad" not in text and "context_compacted" not in text
+
+
+def test_trim_second_line_user_message(tmp_path, monkeypatch):
+    """M2 regression: a file whose second line is a user message must still
+    trim cleanly (opener rows are kept by type, not by position)."""
+    from conftest import (
+        SID,
+        encode_session,
+        session_meta,
+        task_complete,
+        task_started,
+        turn_context,
+        user_message,
+    )
+
+    home = tmp_path / "m2"
+    (home / "sessions" / "2026" / "01" / "01").mkdir(parents=True)
+    path = home / "sessions" / "2026" / "01" / "01" / f"rollout-x-{SID}.jsonl"
+    rows = [
+        session_meta(),
+        user_message("ANCHOR here", turn_id="t9"),   # second line already
+        task_started("t9"),
+        turn_context("t9", "m"),
+        task_complete("t9"),
+    ]
+    path.write_bytes(encode_session(rows))
+    monkeypatch.setenv("CODEX_HOME", str(home))
+
+    doctor_fix.cmd_trim(make_args(anchor_text="ANCHOR here", file=str(path)))
+    rows = reload_rows(path)
+    user_msgs = [
+        ((r.get("payload") or {}).get("input_text") or "")
+        for r in rows
+        if (r.get("payload") or {}).get("type") == "message"
+        and (r.get("payload") or {}).get("role") == "user"
+    ]
+    assert user_msgs and user_msgs[0].strip() == "ANCHOR here"
+
+
 def test_scrub_cleans_everything(home: Path):
     doctor_fix.cmd_scrub(make_args(
         error_text=[GATEWAY_ERROR],

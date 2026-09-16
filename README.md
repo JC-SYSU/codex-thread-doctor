@@ -94,11 +94,13 @@ has never seen.
 
 ## Data, cleanup, safety
 
-A repair reads the session JSONL, writes a backup next to it, and atomically
-replaces the file. To undo any repair: `doctor_fix.py restore --backup <file>
---target <file>`, or delete the backup directory entirely. Shadow verifications
-write only to temp directories removed on exit. Re-run the audit any time;
-both audit and verify are read-only against the real home.
+A repair reads the session JSONL, writes a verified backup under
+`~/.codex/.thread-doctor-backups/`, and atomically replaces the file. To undo
+any repair: `doctor_fix.py restore --backup <file> --target <file>`, or delete
+the backup directory entirely. Shadow verifications write only to temp
+directories removed on exit (their run logs stay in the backup directory).
+Re-run the audit any time; both audit and verify are read-only against the
+real home.
 
 Check that each script reports 0 errors and the tests pass on your machine
 after the agent install (INSTALL.md section 5). Codex CLI is an external

@@ -28,7 +28,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NoReturn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -37,11 +37,14 @@ from doctor_lib import atomic_write, find_session_file
 
 MODEL_KEYS = {"model"}
 EFFORT_KEYS = {"effort", "reasoning_effort"}
+# Row types that may legitimately precede the first user message and survive
+# a trim (opener metadata, per-turn context, thread settings).
+PRE_ANCHOR_TYPES = {"session_meta", "turn_context", "thread_settings"}
 
 
 # ------------------------------------------------------------------ helpers
 
-def die(msg: str) -> None:
+def die(msg: str) -> NoReturn:
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(2)
 
@@ -63,6 +66,11 @@ def split_parse(data: bytes, session_id: str | None = None):
             rows.append(json.loads(stripped))
         except json.JSONDecodeError as exc:
             raise ValueError(f"invalid JSON on line {i}: {exc}") from exc
+        if not isinstance(rows[-1], dict):
+            raise ValueError(
+                f"line {i}: expected a JSON object, got "
+                f"{type(rows[-1]).__name__}"
+            )
         kept.append(i - 1)
     if session_id is not None and rows:
         actual = lib.row_session_id(rows)
@@ -119,6 +127,13 @@ def filter_rows(
 
 
 def load_target(args) -> tuple[Path, list[bytes], list[dict], list[int]]:
+    try:
+        return _load_target(args)
+    except (ValueError, AttributeError) as exc:
+        die(f"{exc}")
+
+
+def _load_target(args) -> tuple[Path, list[bytes], list[dict], list[int]]:
     home = lib.codex_home()
     if args.file:
         path = Path(args.file)
@@ -161,6 +176,9 @@ def finish(
             backup = Path(args.backup)
             if backup.is_file():
                 lib.restore_backup(backup, path)
+            for bk, tgt in (getattr(args, "extra_restores", None) or []):
+                if Path(bk).is_file():
+                    lib.restore_backup(Path(bk), Path(tgt))
             die(f"post-write check failed: {name} (original restored from {backup})")
     post_sha = lib.sha256(path.read_bytes())
     print(f"session: {args.session_id}")
@@ -179,7 +197,8 @@ def add_session_args(parser: argparse.ArgumentParser) -> None:
         help="session JSONL path; overrides id-based lookup (still preflights the id)",
     )
     parser.add_argument(
-        "--backup-dir", default=None, help="backup directory (default: ~/.codex/.thread-doctor-backups)"
+        "--backup-dir", default=None,
+        help="backup directory (default: $CODEX_HOME/.thread-doctor-backups)",
     )
 
 
@@ -298,54 +317,67 @@ def cmd_remove_compaction(args) -> None:
     args.backup, pre_sha = lib.save_snapshot(path, backup_dir, "remove-compaction")
 
     checkpoints = set(args.checkpoint)
-    hit_timestamps: set[str] = set()
+
+    def history_ids(row: dict) -> set[str]:
+        ids = {
+            e.get("checkpoint_id") or e.get("id")
+            for e in (row.get("replacement_history") or [])
+            if isinstance(e, dict)
+        }
+        return {i for i in ids if i}
+
+    def ts_matches(row: dict) -> bool:
+        if not args.checkpoint_time:
+            return False
+        return (
+            row.get("timestamp") == args.checkpoint_time
+            or (row.get("event_msg") or {}).get("timestamp") == args.checkpoint_time
+            or (row.get("payload") or {}).get("timestamp") == args.checkpoint_time
+        )
+
+    def event_cp(row: dict):
+        """Checkpoint id a context_compacted event reports, on event_msg or
+        payload (different writers put it in different places)."""
+        ev = row.get("event_msg") or {}
+        cp = (ev.get("compaction") or {}).get("checkpoint_id")
+        if cp is None:
+            cp = ((row.get("payload") or {}).get("compaction") or {}).get("checkpoint_id")
+        return cp
 
     def bad_compacted(row: dict) -> bool:
         if row.get("type") != "compacted":
             return False
-        if args.checkpoint_time and row.get("timestamp") == args.checkpoint_time:
-            hit_timestamps.add(row["timestamp"])
-            return True
-        history = row.get("replacement_history") or []
-        ids = {
-            e.get("checkpoint_id") or e.get("id")
-            for e in history if isinstance(e, dict)
-        }
-        if ids & checkpoints:
-            ts = row.get("timestamp")
-            if ts:
-                hit_timestamps.add(ts)
-            return True
-        return False
+        return bool(history_ids(row) & checkpoints) or ts_matches(row)
 
-    dropped: set[int] = set()
+    drop: set[int] = set()
     rows, kept, removed_compacted, first_dropped = filter_rows(rows, kept, bad_compacted)
-    dropped |= first_dropped
+    drop |= first_dropped
 
     def paired_event(row: dict) -> bool:
         ev = row.get("event_msg") or {}
         if ev.get("type") != "context_compacted":
             return False
-        # The timestamp may live on event_msg or payload depending on writer.
-        ts = ev.get("timestamp") or (row.get("payload") or {}).get("timestamp")
-        return ts in hit_timestamps
+        # Primary key: the checkpoint id the event reports. Timestamp is the
+        # fallback for writers that don't carry the id.
+        return event_cp(row) in checkpoints or ts_matches(row)
 
     rows, kept, removed_events, second_dropped = filter_rows(rows, kept, paired_event)
-    dropped |= second_dropped
+    drop |= second_dropped
 
     if not removed_compacted:
         print(f"no compacted records matched {sorted(checkpoints)} in {path}")
         return
 
-    def balanced(r: list[dict]) -> bool:
-        c, e = lib.compaction_pair_counts(r)
-        # A compacted record with no completion event is the normal shape;
-        # only an event with no record (or an excess of events) is an anomaly.
-        return c == e or e == 0
-
-    def no_trace(r: list[dict]) -> bool:
+    def no_residual(r: list[dict]) -> bool:
         for row in r:
-            if bad_compacted(row):
+            ev = row.get("event_msg") or {}
+            if row.get("type") == "compacted" and (history_ids(row) & checkpoints):
+                return False
+            if (
+                ev.get("type") == "context_compacted"
+                and (event_cp(row) is not None and event_cp(row) in checkpoints
+                     or ts_matches(row))
+            ):
                 return False
         return True
 
@@ -353,8 +385,8 @@ def cmd_remove_compaction(args) -> None:
         args, path, raw_lines, rows, kept, "remove-compaction", pre_sha,
         [f"removed compacted records: {len(removed_compacted)}",
          f"removed context_compacted events: {len(removed_events)}"],
-        [("compaction pairs balanced", balanced), ("no matching checkpoints left", no_trace)],
-        remove_raw=dropped,
+        [("no matching checkpoints or events remain", no_residual)],
+        remove_raw=drop,
     )
 
 
@@ -392,6 +424,10 @@ def cmd_scrub(args) -> None:
             blob = index.read_bytes()
             new_blob, index_removed = lib.dedupe_index(blob, args.session_id)
             if index_removed:
+                index_backup, _ = lib.save_snapshot(index, backup_dir, "scrub-index")
+                args.extra_restores = (getattr(args, "extra_restores", None) or []) + [
+                    (str(index_backup), str(index))
+                ]
                 atomic_write(index, new_blob)
                 print(f"index:  deduplicated {index_removed} entry/ies in {index}")
 
@@ -450,14 +486,17 @@ def cmd_trim(args) -> None:
             dropped_raw.add(raw_idx)
             continue
         if i < anchor_idx:
-            # Keep the session opener rows, plus records chained to the
-            # anchor turn (its turn_context / lifecycle records); everything
-            # else before the anchor is cut.
-            keep = i < 2 or (
-                anchor_turn is not None
-                and (
-                    payload.get("turn_id") == anchor_turn
-                    or event.get("turn_id") == anchor_turn
+            # Keep opener / metadata rows by type (not by position — the
+            # second line may well be a user message) plus records chained to
+            # the anchor turn; everything else before the anchor is cut.
+            keep = (
+                payload.get("type") in PRE_ANCHOR_TYPES
+                or (
+                    anchor_turn is not None
+                    and (
+                        payload.get("turn_id") == anchor_turn
+                        or event.get("turn_id") == anchor_turn
+                    )
                 )
             )
             if not keep:
@@ -482,6 +521,11 @@ def cmd_trim(args) -> None:
             else:
                 cont_kept_rows.append(row)
                 cont_new_kept.append(raw_idx)
+        if cont_removed:
+            cont_backup, _ = lib.save_snapshot(cont_path, backup_dir, "trim-continuation")
+            args.extra_restores = (getattr(args, "extra_restores", None) or []) + [
+                (str(cont_backup), str(cont_path))
+            ]
         atomic_write(cont_path, render_output(cont_raw, cont_kept_rows, cont_new_kept))
         cont_report = (
             f"{cont_path} (removed {len(cont_removed)} compaction records)"

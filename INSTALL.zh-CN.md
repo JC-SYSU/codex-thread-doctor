@@ -42,7 +42,7 @@ python3 scripts/doctor_verify.py --help  >/dev/null && echo VERIFY_OK
 python3 -m pytest tests/ -q        # 需要 pytest（仅开发依赖）
 ```
 
-预期：全部通过（干净检出为 `20 passed`）。
+预期：全部通过（干净检出为 `25 passed`）。
 失败：`ModuleNotFoundError: pytest` → `python3 -m pip install -r requirements.txt` 后重跑；工具本身零运行时依赖，这步可跳过。
 
 ## 4. 确认 doctor 能看到你的会话
@@ -63,7 +63,7 @@ python3 scripts/doctor_audit.py --all | head -20
 | 5.1 | CLI 入口可用 | 重跑第 2 步命令 | `AUDIT_OK` `FIX_OK` `VERIFY_OK` |
 | 5.2 | 语法检查干净 | `python3 -m py_compile scripts/*.py` | 无输出，退出码 0 |
 | 5.3 | doctor 解析到真实配置目录 | 第 4 步输出 | 表格里是你的会话；有 `summary` 行 |
-| 5.4 | （可选）测试通过 | 第 3 步 | `20 passed` |
+| 5.4 | （可选）测试通过 | 第 3 步 | `25 passed` |
 | 5.5 | 备份目录可写 | `python3 -c "import sys;sys.path.insert(0,'scripts');import doctor_lib;print(doctor_lib.default_backup_dir())"` | 打印 `.../.thread-doctor-backups`；尚未写入任何东西 |
 
 ## 6. 卸载
