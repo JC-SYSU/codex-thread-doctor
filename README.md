@@ -45,11 +45,11 @@ coding agent). The agent reads `INSTALL.md` and does the work:
 
 ```
 You are installing Codex Thread Doctor. The source repository is
-https://github.com/<your-org>/codex-thread-doctor. Do the following:
+https://github.com/JC-SYSU/codex-thread-doctor. Do the following:
 
 1. Clone that repository to a sensible location (e.g. ~/codex-thread-doctor) and cd into it.
    If you cannot clone, read the installation spec directly:
-   https://raw.githubusercontent.com/<your-org>/codex-thread-doctor/main/INSTALL.md
+   https://raw.githubusercontent.com/JC-SYSU/codex-thread-doctor/main/INSTALL.md
 2. Read INSTALL.md in full (INSTALL.zh-CN.md if preferred) and execute it step by step:
    verify the prerequisites, confirm the Codex config directory, smoke-test the three
    entry points (doctor_audit.py / doctor_fix.py / doctor_verify.py --help), and run the
