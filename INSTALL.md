@@ -51,7 +51,7 @@ the `sys.path` bootstrap at the top of each script is missing.
 python3 -m pytest tests/ -q        # requires pytest (dev-only dependency)
 ```
 
-Expected: all tests pass (`25 passed` with a clean checkout).
+Expected: all tests pass (`34 passed` with a clean checkout).
 Failure: `ModuleNotFoundError: pytest` → `python3 -m pip install -r requirements.txt`,
 then re-run; the toolkit itself has zero runtime dependencies, so this step is
 optional.
@@ -79,7 +79,7 @@ below is the end of the install.
 | 5.1 | CLI entry points work | run step 2 commands again | `AUDIT_OK` `FIX_OK` `VERIFY_OK` |
 | 5.2 | Import check clean | `python3 -m py_compile scripts/*.py` | no output, exit 0 |
 | 5.3 | Doctor resolves the real config dir | step 4 output | table shows your sessions; `summary` line present |
-| 5.4 | (optional) tests pass | step 3 | `25 passed` |
+| 5.4 | (optional) tests pass | step 3 | `34 passed` |
 | 5.5 | Backup dir writable | `python3 -c "import sys;sys.path.insert(0,'scripts');import doctor_lib;print(doctor_lib.default_backup_dir())"` | prints `.../.thread-doctor-backups`; nothing written yet |
 
 ## 6. Uninstall

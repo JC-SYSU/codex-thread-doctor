@@ -29,6 +29,7 @@ def make_args(**kw) -> argparse.Namespace:
         "checkpoint": None,
         "checkpoint_time": None,
         "error_text": [],
+        "clear_error_texts": False,
         "orphan_turn": [],
         "dedupe_index": False,
         "anchor_text": None,
@@ -227,6 +228,52 @@ def test_trim_cuts_history_at_anchor(home: Path):
     assert "earlier history, to be trimmed" not in text
     assert "cmp_bad1" not in text
     assert len(rows) < len(rows_before)
+
+
+def test_drop_unanswered_calls_modern(tmp_path, monkeypatch):
+    """A call whose output never arrived is removed with a count guard."""
+    from conftest import SID, write_modern_session
+
+    home = tmp_path / "dud"
+    (home / "sessions").mkdir(parents=True)
+    path = write_modern_session(home)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+
+    doctor_fix.cmd_drop_unanswered_calls(
+        make_args(session_id=SID, file=str(path), expect_count=1)
+    )
+    rows = reload_rows(path)
+    calls = [
+        (r.get("payload") or {}) for r in rows
+        if (r.get("payload") or {}).get("type") == "function_call"
+    ]
+    assert calls == []
+    assert backups(home)
+
+
+def test_scrub_clears_terminal_error_message_opt_in(tmp_path, monkeypatch):
+    """--clear-error-texts blanks the message inside the error object while
+    keeping codex_error_info (the machine-readable status)."""
+    from conftest import SID, write_modern_session
+
+    home = tmp_path / "err"
+    (home / "sessions").mkdir(parents=True)
+    path = write_modern_session(home)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+
+    doctor_fix.cmd_scrub(make_args(
+        session_id=SID, file=str(path),
+        error_text=["usage limit hit"], clear_error_texts=True,
+    ))
+    rows = reload_rows(path)
+    err = next(
+        ((r.get("payload") or {}).get("error") for r in rows
+         if (r.get("payload") or {}).get("error")),
+        None,
+    )
+    assert isinstance(err, dict), "the terminal event must stay"
+    assert err["message"] == ""
+    assert err["codex_error_info"] == "usage_limit_exceeded"
 
 
 def test_restore_round_trip(home: Path, tmp_path: Path):

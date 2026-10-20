@@ -50,9 +50,13 @@ def session_stats(path: Path) -> dict:
         "history_models": [],
         "empty_call_ids": 0,
         "unmatched_outputs": 0,
+        "calls_without_outputs": 0,
         "compaction_balanced": True,
         "compactions": 0,
         "unfinished_starts": 0,
+        "unfinished_turns": 0,
+        "aborted_turns": {},
+        "error_kinds": {},
     }
     data = path.read_bytes()
     if not data.strip():
@@ -80,26 +84,65 @@ def session_stats(path: Path) -> dict:
         if efforts:
             stats["last_effort"] = efforts[-1]
     for row in rows:
-        payload = row.get("payload") or {}
+        payload = lib.state_payload(row)
         for t in lib.CALL_TYPES:
             if payload.get("type") == t and not payload.get("call_id"):
                 stats["empty_call_ids"] += 1
     stats["unmatched_outputs"] = count_unmatched(rows)
+    stats["calls_without_outputs"] = count_calls_without_outputs(rows)
     c, e = lib.compaction_pair_counts(rows)
     stats["compactions"] = c
     stats["compaction_events"] = e
     # A compacted record with no event is the normal shape. The anomaly is
     # the reverse: completion events with no compacted record at all.
     stats["compaction_balanced"] = not (e > 0 and c == 0)
-    started = completed = 0
+
+    # Lifecycle: pair start/terminal events by turn id (both rollout shapes).
+    started: dict[str, int] = {}
+    terminal: set[str] = set()
+    aborted: dict[str, int] = {}
+    error_kinds: dict[str, int] = {}
     for row in rows:
-        payload = row.get("payload") or {}
-        if payload.get("type") == "task_started":
-            started += 1
-        if payload.get("type") in ("task_complete", "task_error"):
-            completed += 1
-    stats["unfinished_starts"] = max(0, started - completed)
+        et = lib.event_of(row)
+        t = et.get("type")
+        tid = et.get("turn_id") or et.get("task_id")
+        if t in lib.LIFECYCLE_START:
+            if isinstance(tid, str):
+                started[tid] = 1
+        elif t in lib.LIFECYCLE_TERMINAL:
+            if isinstance(tid, str):
+                terminal.add(tid)
+            if t == "turn_aborted":
+                reason = str(et.get("reason") or "unknown")
+                aborted[reason] = aborted.get(reason, 0) + 1
+            err = et.get("error")
+            if isinstance(err, dict):
+                label = error_label(err.get("codex_error_info"))
+                error_kinds[label] = error_kinds.get(label, 0) + 1
+        elif t in ("error", "stream_error"):
+            label = error_label(et.get("codex_error_info"))
+            error_kinds[label] = error_kinds.get(label, 0) + 1
+
+    stats["unfinished_turns"] = sum(1 for tid in started if tid not in terminal)
+    stats["unfinished_starts"] = stats["unfinished_turns"]  # legacy key
+    stats["aborted_turns"] = aborted
+    stats["error_kinds"] = error_kinds
     return stats
+
+
+def error_label(info) -> str:
+    """Normalize codex_error_info (string or single-key object) to a name."""
+    if isinstance(info, str):
+        return info
+    if isinstance(info, dict) and len(info) == 1:
+        return str(next(iter(info)))
+    return "unknown"
+
+
+def count_calls_without_outputs(rows: list[dict]) -> int:
+    """Calls whose output never arrived — the residue of a stream that died
+    mid-tool-call."""
+    return len(lib.unanswered_call_ids(rows))
 
 
 def count_unmatched(rows) -> int:
@@ -107,13 +150,13 @@ def count_unmatched(rows) -> int:
     independent, so an output preceding its call is still matched)."""
     called: set[str] = set()
     for row in rows:
-        payload = row.get("payload") or {}
+        payload = lib.state_payload(row)
         for t in lib.CALL_TYPES:
             if payload.get("type") == t and payload.get("call_id"):
                 called.add(payload["call_id"])
     unmatched = 0
     for row in rows:
-        payload = row.get("payload") or {}
+        payload = lib.state_payload(row)
         for out_t in lib.CALL_TYPES.values():
             if payload.get("type") == out_t:
                 cid = payload.get("call_id")
@@ -130,6 +173,8 @@ def at_risk(stats: dict, blocked: set[str]) -> bool:
     if stats.get("empty_call_ids"):
         return True
     if stats.get("unmatched_outputs"):
+        return True
+    if stats.get("calls_without_outputs"):
         return True
     if not stats.get("compaction_balanced"):
         return True
@@ -183,8 +228,16 @@ def render_table(result: dict, blocked: set[str]) -> str:
             risks.append(f"EMPTY_CALL_ID:{s['empty_call_ids']}")
         if s["unmatched_outputs"]:
             risks.append(f"UNMATCHED:{s['unmatched_outputs']}")
+        if s.get("calls_without_outputs"):
+            risks.append(f"CALLS_NO_OUTPUT:{s['calls_without_outputs']}")
         if not s["compaction_balanced"]:
             risks.append(f"COMPACTION:{s['compactions']}")
+        if s.get("error_kinds"):
+            risks.append("ERRORS:" + ",".join(
+                f"{k}={v}" for k, v in sorted(s["error_kinds"].items())))
+        if s.get("aborted_turns"):
+            risks.append("ABORTED:" + ",".join(
+                f"{k}={v}" for k, v in sorted(s["aborted_turns"].items())))
         if s["unfinished_starts"]:
             risks.append(f"UNFINISHED:{s['unfinished_starts']}")  # informational only
         lines.append(

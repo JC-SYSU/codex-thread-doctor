@@ -20,10 +20,11 @@ audit（只读）──► 备份 + SHA-256 ──► 修复（原子写、落�
 | 空或重复的 tool `call_id`（导致自动压缩 HTTP 400） | `call-ids` |
 | reasoning 条目 `invalid_encrypted_content` | `remove-lines`（必须带精确 `--expect-count` 护栏） |
 | 损坏的压缩检查点 `cmp_…` 阻断恢复 | `remove-compaction` |
+| 断流导致输出缺失的工具调用 | `drop-unanswered-calls` |
 | 按锚点消息裁剪历史（支持跨文件线程） | `trim` |
-| 可选清理：网关错误文本、孤立启动、索引重复 | `scrub` |
+| 可选清理：网关错误文本、孤立启动、索引重复 | `scrub [--clear-error-texts]` |
 
-工具绝不改写对话正文（显式 `--error-text` 清理除外）、`cwd`、权限、turn id、会话 id。历史里*提到*旧错误的文字是证据，不是缺陷——工具只读机器状态字段和生命周期记录。支持 macOS / Linux / Windows；Python 3.11+，零运行时依赖；唯一驱动的外部工具是 Codex CLI 本身。`session_index.jsonl` 默认不碰，除非你显式加 `--dedupe-index`。
+工具同时读取两代 rollout 格式（旧的 `{event_msg:{…}}` 与现行的 `{type:"event_msg",payload:{…}}`），并把断流留下的痕迹（`ERRORS:…`、`ABORTED:…`、`CALLS_NO_OUTPUT:…`）作为画像报告，不当作缺陷。工具绝不改写对话正文（显式 `--error-text` 清理除外）、`cwd`、权限、turn id、会话 id。历史里*提到*旧错误的文字是证据，不是缺陷——工具只读机器状态字段和生命周期记录。支持 macOS / Linux / Windows；Python 3.11+，零运行时依赖；唯一驱动的外部工具是 Codex CLI 本身。`session_index.jsonl` 默认不碰，除非你显式加 `--dedupe-index`。
 
 ## 安装
 

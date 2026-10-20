@@ -94,6 +94,34 @@ for every entry.
   message-bearing fields, orphaned starts are dropped only for the turn_ids
   you name, `--dedupe-index` keeps the newest `session_index.jsonl` entry.
 
+## 7. Relay outages: `stream disconnected before completion` banners
+
+- **Symptom**: the UI shows repeated "stream disconnected before completion:
+  …" cards and reconnect attempts; the thread eventually continues or the
+  turn ends with an error.
+- **What is stored**: the live banners are not durable. In the current
+  writer, `EventMsg::Error` and `EventMsg::StreamError` are classified as
+  transient events (`codex-rs/rollout/src/policy.rs`) and never reach the
+  JSONL. Only the resulting lifecycle records survive:
+  `task_started` / `task_complete` / `turn_aborted`, with an optional
+  `error.codex_error_info` on terminal events.
+- **Evidence**: `audit` reports `ERRORS:<kind>=n` (e.g.
+  `usage_limit_exceeded`, `response_stream_disconnected`,
+  `server_overloaded`, `response_too_many_failed_attempts`) and
+  `ABORTED:interrupted=n`. `CALLS_NO_OUTPUT:n` means a stream died after a
+  tool call and its output never arrived.
+- **Treatment**: runtime errors alone need no file surgery — resume and let
+  the client retry. Repair only the structural residue:
+  `doctor_fix.py call-ids` for empty/duplicate ids, then
+  `doctor_fix.py drop-unanswered-calls --expect-count <n>` for calls whose
+  output never arrived (removing a call that never completed also removes
+  the half-turn the server would otherwise try to compress). If an old
+  rollout did persist failure text, blank it with
+  `doctor_fix.py scrub --error-text '<text>' --clear-error-texts`; the error
+  status (`codex_error_info`) stays intact.
+- **Verify**: `doctor_verify.py --force-compact-window 40000` on the shadow
+  copy — a thread that survives a real compaction is structurally healthy.
+
 ## Cross-cutting truths (from real repair sessions)
 
 - `codex exec resume --ephemeral` still appends lifecycle events to the real

@@ -15,6 +15,22 @@ The filename embeds the session id (UUID). A `rollout-…` file can be byte-for-
 identical in `sessions/` and `archived_sessions/` — always treat the active copy
 as authoritative.
 
+## Two persisted shapes
+
+The same session directory can hold both generations:
+
+```json
+{"timestamp":"…","ordinal":0,"type":"event_msg","payload":{"type":"task_started",…}}
+{"timestamp":"…","ordinal":1,"event_msg":{"type":"task_started",…}}
+```
+
+Current files nest the event under `payload` and repeat its type at the top
+level; older files use the `event_msg` key. The doctor normalizes both via
+`event_of()` / `state_payload()`. Response items live in `payload` directly
+(`{"type":"response_item","payload":{"type":"function_call",…}}`); some
+writers wrap them as `item_completed` items, which `state_payload()`
+unwraps.
+
 ## Record types that matter for repair
 
 | `type` | Shape | Why it matters |
@@ -27,7 +43,8 @@ as authoritative.
 | `function_call` / `function_call_output` | `payload.call_id` (+ `id`, `name`, `arguments`) | empty or duplicate `call_id` breaks server-side compaction (`HTTP 400`) once the thread gets long enough |
 | `custom_tool_call` / `custom_tool_call_output`, `tool_search_call` / `tool_search_output` | same pattern | same pairing rules |
 | `reasoning` | `payload.response_item.encrypted_content` (JWK-style base64) | `Payload too long` / validation errors when the encrypted blob is a placeholder that cannot be decrypted |
-| `task_started` / `task_complete` / `task_error` | `payload.turn_id` | orphaned `task_started` (no later finish) is usually a rolled-back turn, informational |
+| `task_started` / `task_complete` / `turn_aborted` / `task_error` (also `turn_started` / `turn_complete`) | `payload.turn_id`; `turn_aborted.reason`; `task_complete.error.codex_error_info` | orphaned starts are usually rolled-back turns (informational); terminal errors and abort reasons are the durable trace of a relay outage |
+| `error` / `stream_error` | `payload.message`, `payload.codex_error_info` | legacy rollouts may contain them; the current writer classifies both as transient and does not persist them |
 | `message` | `payload.role == "user"`, `payload.input_text` | the only record the trim tool locates anchors in |
 
 ## Field-level invariants

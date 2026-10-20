@@ -174,3 +174,68 @@ def home(tmp_path: Path, monkeypatch) -> Path:
 @pytest.fixture
 def bad_rows() -> list[dict]:
     return bad_session_rows()
+
+
+# --------------------------------------------------- current rollout format
+
+def modern_session_rows() -> list[dict]:
+    """Current shape: type at top level, event payload nested under payload.
+
+    Contains: a completed turn with an embedded usage-limit error, an
+    interrupted turn, a still-running turn (no terminal event), a call whose
+    output never arrived, and a compaction record with payload-level history.
+    """
+    done_turn = "01a10000-0000-7000-8000-000000000001"
+    aborted_turn = "01a10000-0000-7000-8000-000000000002"
+    running_turn = "01a10000-0000-7000-8000-000000000003"
+
+    def ev(payload: dict) -> dict:
+        return {"type": "event_msg", "timestamp": "2026-10-16T00:00:00.000Z",
+                "ordinal": 0, "payload": payload}
+
+    return [
+        {"type": "session_meta", "timestamp": "2026-10-16T00:00:00.000Z",
+         "ordinal": 0, "payload": {"type": "session_meta", "session_id": SID,
+                                   "id": SID, "cwd": "/work"}},
+        ev({"type": "task_started", "turn_id": done_turn,
+            "started_at": 1, "model_context_window": 258400}),
+        {"type": "response_item", "timestamp": "2026-10-16T00:00:01.000Z",
+         "ordinal": 1,
+         "payload": {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "first question"}]}},
+        {"type": "response_item", "timestamp": "2026-10-16T00:00:02.000Z",
+         "ordinal": 2,
+         "payload": {"type": "function_call", "id": "fc_1",
+                     "name": "shell", "arguments": "{}",
+                     "call_id": "call_missing_output"}},
+        ev({"type": "task_complete", "turn_id": done_turn,
+            "last_agent_message": None,
+            "error": {"message": "usage limit hit",
+                      "codex_error_info": "usage_limit_exceeded"},
+            "started_at": 1, "completed_at": 3}),
+        ev({"type": "task_started", "turn_id": aborted_turn, "started_at": 4}),
+        ev({"type": "turn_aborted", "turn_id": aborted_turn,
+            "reason": "interrupted", "started_at": 4, "completed_at": 6}),
+        ev({"type": "task_started", "turn_id": running_turn, "started_at": 7}),
+        {"type": "compacted", "timestamp": "2026-10-16T00:00:09.000Z",
+         "ordinal": 9,
+         "payload": {"message": "summary",
+                     "replacement_history": [
+                         {"type": "message", "id": "msg_old_1"},
+                         {"type": "message", "id": "msg_old_2"}],
+                     "window_number": 1,
+                     "window_id": "win_bad_1",
+                     "previous_window_id": "win_prev_1",
+                     "compaction_response_id": "resp_bad_1"}},
+        ev({"type": "context_compacted", "turn_id": running_turn,
+            "compaction": {"checkpoint_id": "win_bad_1"}}),
+    ]
+
+
+def write_modern_session(home: Path, rows: list[dict] | None = None,
+                         sid: str = SID) -> Path:
+    sub = home / "sessions" / "2026" / "10" / "16"
+    sub.mkdir(parents=True, exist_ok=True)
+    path = sub / f"rollout-2026-10-16T00-00-00-{sid}.jsonl"
+    path.write_bytes(encode_session(rows or modern_session_rows()))
+    return path

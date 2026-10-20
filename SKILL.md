@@ -28,8 +28,14 @@ python3 scripts/doctor_audit.py --all --blocked-model <MODEL_ID> # fleet-wide
 ```
 
 Treat only machine-state indicators: `last_model`, `history_models`,
-`empty_call_ids`, `unmatched_outputs`, `compaction_balanced`, `parse_error`.
-`UNFINISHED` is informational (rolled-back turns) — not a blocker.
+`empty_call_ids`, `unmatched_outputs`, `calls_without_outputs`,
+`compaction_balanced`, `parse_error`. The runtime-failure counters
+(`error_kinds`, `aborted_turns`) show what the thread survived — a relay
+outage leaves `usage_limit_exceeded` / `response_stream_disconnected` /
+`server_overloaded` entries and interrupted turns, and those alone do not
+block resume. `UNFINISHED` is informational (rolled-back turns) — not a
+blocker. Both rollout generations are read: legacy `{event_msg:{…}}` and the
+current `{type:"event_msg", payload:{…}}` shape.
 
 **Done when**: the risk indicators for the thread are listed and each maps to
 a row in `references/failure-modes.md`. If the audit shows no risk at all, the
@@ -60,8 +66,9 @@ fix.
 | empty / duplicate call_id (compaction 400) | `doctor_fix.py call-ids --session-id <id>` |
 | invalid_encrypted_content on a `rs_…` item | `doctor_fix.py remove-lines --session-id <id> --key encrypted_content --value <bad> --expect-count N` |
 | corrupted compaction checkpoint `cmp_…` | `doctor_fix.py remove-compaction --session-id <id> --checkpoint <cmp_…> [--checkpoint-time <ts>]` |
+| tool call with no output (stream died mid-call) | `doctor_fix.py drop-unanswered-calls --session-id <id> [--expect-count N]` |
 | trim history at an anchor message | `doctor_fix.py trim --session-id <id> --anchor-text '<exact user text>' [--continuation <file>]` |
-| optional cleanup: error text / orphan starts / index dupes | `doctor_fix.py scrub --session-id <id> [--error-text '<t>'] [--orphan-turn <t>] [--dedupe-index]` |
+| optional cleanup: error text / orphan starts / index dupes | `doctor_fix.py scrub --session-id <id> [--error-text '<t>'] [--clear-error-texts] [--orphan-turn <t>] [--dedupe-index]` |
 
 Details per failure — symptoms, evidence, per-command caveats, repeated
 checkpoint chains — live in `references/failure-modes.md`; read the matching

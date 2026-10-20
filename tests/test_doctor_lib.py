@@ -187,6 +187,46 @@ def test_parse_jsonl_line_number_error():
         raise AssertionError("expected ValueError")
 
 
+def test_event_of_supports_both_rollout_shapes():
+    legacy = {"event_msg": {"type": "task_started", "turn_id": "t1"}}
+    modern = {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}}
+    assert lib.event_type(legacy) == "task_started"
+    assert lib.event_type(modern) == "task_started"
+    assert lib.event_of(modern)["turn_id"] == "t1"
+    assert lib.event_of({"type": "response_item", "payload": {"type": "message"}}) == {}
+
+
+def test_state_payload_unwraps_item_completed():
+    row = {"type": "event_msg", "payload": {
+        "type": "item_completed",
+        "item": {"type": "function_call", "call_id": "c1"}}}
+    assert lib.state_payload(row)["type"] == "function_call"
+    plain = {"type": "response_item", "payload": {"type": "function_call"}}
+    assert lib.state_payload(plain)["type"] == "function_call"
+
+
+def test_user_messages_all_shapes():
+    rows = [
+        {"payload": {"type": "message", "role": "user", "input_text": "legacy"}},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "modern"}]}},
+        {"type": "event_msg", "payload": {
+            "type": "item_completed",
+            "item": {"type": "UserMessage",
+                     "content": [{"type": "text", "text": "item"}]}}},
+    ]
+    assert [t for _, t in lib.user_messages(rows)] == ["legacy", "modern", "item"]
+
+
+def test_is_compaction_modern_shape():
+    modern = {"type": "event_msg",
+              "payload": {"type": "context_compacted", "timestamp": "t"}}
+    assert lib.is_compaction(modern)
+    compacted_row = {"type": "compacted", "payload": {"replacement_history": []}}
+    assert lib.is_compaction(compacted_row)
+
+
 def test_find_session_file_archived_and_active(tmp_path: Path):
     home = tmp_path
     (home / "sessions" / "2026" / "01" / "01").mkdir(parents=True)

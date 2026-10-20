@@ -28,10 +28,15 @@ audit (read-only) ──► backup + SHA-256 ──► fix (atomic, re-asserted)
 | empty or duplicate tool `call_id` (breaks auto-compaction with HTTP 400) | `call-ids` |
 | `invalid_encrypted_content` on reasoning items | `remove-lines` with an exact `--expect-count` guard |
 | corrupted compaction checkpoint `cmp_…` blocking resume | `remove-compaction` |
+| tool call whose output never arrived (stream died mid-call) | `drop-unanswered-calls` |
 | trim history before an anchor message (cross-file threads included) | `trim` |
-| optional cleanup: gateway error text, orphaned starts, duplicate index entries | `scrub` |
+| optional cleanup: gateway error text, orphaned starts, duplicate index entries | `scrub [--clear-error-texts]` |
 
-It never rewrites conversation text (beyond an explicit `--error-text` scrub),
+It reads both rollout generations — legacy `{event_msg:{…}}` records and the
+current `{type:"event_msg",payload:{…}}` shape — and reports relay-outage
+traces (`ERRORS:…`, `ABORTED:…`, `CALLS_NO_OUTPUT:…`) without treating them
+as defects. It never rewrites conversation text (beyond an explicit
+`--error-text` scrub),
 `cwd`, permissions, turn ids, or session ids. History that merely *mentions* an
 old error is evidence, not a defect — the tools only read machine-state fields
 and lifecycle records. Runs on macOS, Linux, and Windows; Python 3.11+, zero

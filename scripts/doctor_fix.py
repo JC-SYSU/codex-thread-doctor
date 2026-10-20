@@ -14,7 +14,8 @@ Usages:
   python doctor_fix.py call-ids --session-id <id>
   python doctor_fix.py remove-lines --session-id <id> --key encrypted_content --value <bad> [--expect-count N]
   python doctor_fix.py remove-compaction --session-id <id> --checkpoint <id>...
-  python doctor_fix.py scrub --session-id <id> [--error-text <text>]... [--orphan-turn <id>]... [--dedupe-index]
+  python doctor_fix.py drop-unanswered-calls --session-id <id> [--expect-count N]
+  python doctor_fix.py scrub --session-id <id> [--error-text <text>]... [--clear-error-texts] [--orphan-turn <id>]... [--dedupe-index]
   python doctor_fix.py trim --session-id <id> --anchor-text <text> [--continuation <file>]
   python doctor_fix.py restore --backup <file> --target <file>
 
@@ -38,8 +39,15 @@ from doctor_lib import atomic_write, find_session_file
 MODEL_KEYS = {"model"}
 EFFORT_KEYS = {"effort", "reasoning_effort"}
 # Row types that may legitimately precede the first user message and survive
-# a trim (opener metadata, per-turn context, thread settings).
-PRE_ANCHOR_TYPES = {"session_meta", "turn_context", "thread_settings"}
+# a trim: legacy event types plus the current top-level record types.
+PRE_ANCHOR_TYPES = {
+    "session_meta",
+    "turn_context",
+    "thread_settings",
+    "thread_settings_applied",
+    "world_state",
+    "token_usage_record",
+}
 
 
 # ------------------------------------------------------------------ helpers
@@ -319,12 +327,28 @@ def cmd_remove_compaction(args) -> None:
     checkpoints = set(args.checkpoint)
 
     def history_ids(row: dict) -> set[str]:
-        ids = {
-            e.get("checkpoint_id") or e.get("id")
-            for e in (row.get("replacement_history") or [])
-            if isinstance(e, dict)
-        }
-        return {i for i in ids if i}
+        # Current rollouts nest the history under payload; legacy ones put it
+        # at the top level (or inside replacement_history_metadata).
+        candidates = []
+        payload = row.get("payload")
+        if isinstance(payload, dict):
+            candidates.append(payload.get("replacement_history"))
+            meta = payload.get("replacement_history_metadata")
+            if isinstance(meta, list):
+                candidates.append(meta)
+        candidates.append(row.get("replacement_history"))
+        ids: set[str] = set()
+        for history in candidates:
+            if not isinstance(history, list):
+                continue
+            for e in history:
+                if not isinstance(e, dict):
+                    continue
+                for key in ("checkpoint_id", "id", "window_id", "previous_window_id"):
+                    v = e.get(key)
+                    if isinstance(v, str) and v:
+                        ids.add(v)
+        return ids
 
     def ts_matches(row: dict) -> bool:
         if not args.checkpoint_time:
@@ -336,8 +360,8 @@ def cmd_remove_compaction(args) -> None:
         )
 
     def event_cp(row: dict):
-        """Checkpoint id a context_compacted event reports, on event_msg or
-        payload (different writers put it in different places)."""
+        """Checkpoint id a context_compacted event reports, anywhere a writer
+        may have put it."""
         ev = row.get("event_msg") or {}
         cp = (ev.get("compaction") or {}).get("checkpoint_id")
         if cp is None:
@@ -354,8 +378,7 @@ def cmd_remove_compaction(args) -> None:
     drop |= first_dropped
 
     def paired_event(row: dict) -> bool:
-        ev = row.get("event_msg") or {}
-        if ev.get("type") != "context_compacted":
+        if lib.event_type(row) != "context_compacted":
             return False
         # Primary key: the checkpoint id the event reports. Timestamp is the
         # fallback for writers that don't carry the id.
@@ -390,30 +413,93 @@ def cmd_remove_compaction(args) -> None:
     )
 
 
+def cmd_drop_unanswered_calls(args) -> None:
+    path, raw_lines, rows, kept = load_target(args)
+    backup_dir = Path(args.backup_dir or lib.default_backup_dir())
+    args.backup, pre_sha = lib.save_snapshot(path, backup_dir, "drop-unanswered-calls")
+
+    missing = lib.unanswered_call_ids(rows)
+    if args.expect_count is not None and len(missing) != args.expect_count:
+        die(
+            f"expected {args.expect_count} unanswered calls, found {len(missing)} "
+            f"(backup at {args.backup})"
+        )
+    if not missing:
+        print(f"no unanswered calls in {path}")
+        return
+
+    def is_unanswered_call(row: dict) -> bool:
+        payload = lib.state_payload(row)
+        if payload.get("type") not in lib.CALL_TYPES:
+            return False
+        cid = payload.get("call_id") or payload.get("id")
+        return isinstance(cid, str) and cid in missing
+
+    rows, kept, removed, dropped = filter_rows(rows, kept, is_unanswered_call)
+    finish(
+        args, path, raw_lines, rows, kept, "drop-unanswered-calls", pre_sha,
+        [f"removed unanswered tool calls: {len(removed)}",
+         f"removed ids: {', '.join(sorted(missing))}"],
+        [("no unanswered calls remain", lambda r: not lib.unanswered_call_ids(r))],
+        remove_raw=dropped,
+    )
+
+
 def cmd_scrub(args) -> None:
     path, raw_lines, rows, kept = load_target(args)
     backup_dir = Path(args.backup_dir or lib.default_backup_dir())
     args.backup, pre_sha = lib.save_snapshot(path, backup_dir, "scrub")
 
     error_texts = set(args.error_text)
-    msg_fields = ("message", "text", "last_agent_message")
     scrubbed = 0
+    # Legacy display fields plus the current content-block shape. Only
+    # message-bearing fields are touched; tool arguments and user/assistant
+    # prose stay byte-identical.
+    display_fields = ("message", "text", "last_agent_message")
     for row in rows:
         payload = row.get("payload") or {}
-        for key in msg_fields:
+        for key in display_fields:
             v = payload.get(key)
             if isinstance(v, str) and v in error_texts:
                 payload[key] = ""
                 scrubbed += 1
+        content = payload.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    v = block.get("text")
+                    if isinstance(v, str) and v in error_texts:
+                        block["text"] = ""
+                        scrubbed += 1
+
+    # Opt-in: clear terminal error messages that match, keeping the error
+    # object (and its status) intact.
+    errors_cleared = 0
+    if args.clear_error_texts:
+        for row in rows:
+            et = lib.event_of(row)
+            err = et.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message")
+                if isinstance(msg, str) and msg in error_texts:
+                    err["message"] = ""
+                    errors_cleared += 1
 
     orphan_turns = set(args.orphan_turn)
     dropped: set[int] = set()
     if orphan_turns:
-        rows, kept, removed_orphans, dropped = filter_rows(
-            rows, kept,
-            lambda r: r.get("payload", {}).get("type") == "task_started"
-            and r.get("payload", {}).get("turn_id") in orphan_turns,
-        )
+        def is_orphan_start(row: dict) -> bool:
+            payload = row.get("payload") or {}
+            if payload.get("type") in lib.LIFECYCLE_START:
+                turn = payload.get("turn_id") or payload.get("task_id")
+            elif lib.event_type(row) in lib.LIFECYCLE_START:
+                event = lib.event_of(row)
+                turn = event.get("turn_id") or event.get("task_id")
+            else:
+                return False
+            return turn in orphan_turns
+
+        rows, kept, removed_orphans, dropped = filter_rows(rows, kept, is_orphan_start)
     else:
         removed_orphans = []
 
@@ -432,19 +518,21 @@ def cmd_scrub(args) -> None:
                 print(f"index:  deduplicated {index_removed} entry/ies in {index}")
 
     def clean(r: list[dict]) -> bool:
-        return not scan_error_text(r, error_texts)
+        return not scan_error_text(r, error_texts, args.clear_error_texts)
 
     finish(
         args, path, raw_lines, rows, kept, "scrub", pre_sha,
         [f"error text cleared: {scrubbed}",
-         f"orphan task_started removed: {len(removed_orphans)}",
+         f"terminal error messages cleared: {errors_cleared}",
+         f"orphan start events removed: {len(removed_orphans)}",
          f"index duplicates removed: {index_removed}"],
         [("no matching error text remains", clean)],
         remove_raw=dropped,
     )
 
 
-def scan_error_text(rows: list[dict], texts: set[str]) -> list[tuple[str, str]]:
+def scan_error_text(rows: list[dict], texts: set[str],
+                    include_errors: bool = False) -> list[tuple[str, str]]:
     hits = []
     for row in rows:
         payload = row.get("payload") or {}
@@ -452,6 +540,19 @@ def scan_error_text(rows: list[dict], texts: set[str]) -> list[tuple[str, str]]:
             v = payload.get(key)
             if isinstance(v, str) and v in texts:
                 hits.append((key, v))
+        content = payload.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    v = block.get("text")
+                    if isinstance(v, str) and v in texts:
+                        hits.append(("content.text", v))
+        if include_errors:
+            err = lib.event_of(row).get("error")
+            if isinstance(err, dict):
+                v = err.get("message")
+                if isinstance(v, str) and v in texts:
+                    hits.append(("error.message", v))
     return hits
 
 
@@ -460,27 +561,28 @@ def cmd_trim(args) -> None:
     backup_dir = Path(args.backup_dir or lib.default_backup_dir())
     args.backup, pre_sha = lib.save_snapshot(path, backup_dir, "trim")
 
-    # Locate the anchor: the first user message whose input_text matches.
+    # Locate the anchor among user messages in any persisted shape.
     anchor_text = args.anchor_text.strip()
     anchor_idx = None
-    for i, row in enumerate(rows):
-        payload = row.get("payload") or {}
-        if payload.get("type") == "message" and payload.get("role") == "user":
-            text = payload.get("input_text")
-            if isinstance(text, str) and text.strip() == anchor_text:
-                anchor_idx = i
-                break
+    for i, text in lib.user_messages(rows):
+        if text.strip() == anchor_text:
+            anchor_idx = i
+            break
     if anchor_idx is None:
         die(f"anchor text not found among user messages in {path} (backup at {args.backup})")
     assert anchor_idx is not None  # for the type checker after die()
 
-    anchor_turn = rows[anchor_idx].get("payload", {}).get("turn_id")
+    anchor_row = rows[anchor_idx]
+    anchor_turn = (
+        (anchor_row.get("payload") or {}).get("turn_id")
+        or lib.event_of(anchor_row).get("turn_id")
+    )
     removed_all: list[dict] = []
     dropped_raw: set[int] = set()
     kept_rows, new_kept = [], []
     for i, (raw_idx, row) in enumerate(zip(kept, rows)):
         payload = row.get("payload") or {}
-        event = row.get("event_msg") or {}
+        event = lib.event_of(row)
         if lib.is_compaction(row):
             removed_all.append(row)
             dropped_raw.add(raw_idx)
@@ -491,6 +593,7 @@ def cmd_trim(args) -> None:
             # the anchor turn; everything else before the anchor is cut.
             keep = (
                 payload.get("type") in PRE_ANCHOR_TYPES
+                or row.get("type") in PRE_ANCHOR_TYPES
                 or (
                     anchor_turn is not None
                     and (
@@ -532,12 +635,8 @@ def cmd_trim(args) -> None:
         )
 
     def first_user_is_anchor(r: list[dict]) -> bool:
-        for row in r:
-            payload = row.get("payload") or {}
-            if payload.get("type") == "message" and payload.get("role") == "user":
-                return isinstance(payload.get("input_text"), str) and (
-                    payload["input_text"].strip() == anchor_text
-                )
+        for _, text in lib.user_messages(r):
+            return text.strip() == anchor_text
         return False
 
     def no_compaction(r: list[dict]) -> bool:
@@ -597,10 +696,22 @@ def main() -> None:
     p.add_argument("--checkpoint-time", help="fallback: match the compacted record by timestamp")
     p.set_defaults(func=cmd_remove_compaction)
 
+    p = sub.add_parser(
+        "drop-unanswered-calls",
+        help="remove tool calls whose output never arrived (stream died mid-call)",
+    )
+    add_session_args(p)
+    p.add_argument("--expect-count", type=int,
+                   help="assert the exact number of unanswered calls removed")
+    p.set_defaults(func=cmd_drop_unanswered_calls)
+
     p = sub.add_parser("scrub", help="clear error text, drop orphaned task_started, dedupe index")
     add_session_args(p)
     p.add_argument("--error-text", action="append", default=[],
                    help="exact text to blank out of message-bearing fields (repeatable)")
+    p.add_argument("--clear-error-texts", action="store_true",
+                   help="also clear matching messages inside terminal error objects "
+                        "(the error status itself is kept)")
     p.add_argument("--orphan-turn", action="append", default=[],
                    help="turn id whose orphaned task_started should be dropped (repeatable)")
     p.add_argument("--dedupe-index", action="store_true",

@@ -34,11 +34,87 @@ CALL_TYPES = {
 }
 DEFAULT_BACKUP_SUBDIR = ".thread-doctor-backups"
 
+# Lifecycle event names across rollout generations. The current writer emits
+# task_started / task_complete; the protocol variants are TurnStarted /
+# TurnCompleted. Accept both.
+LIFECYCLE_START = {"task_started", "turn_started"}
+LIFECYCLE_TERMINAL = {"task_complete", "turn_complete", "turn_aborted", "task_error"}
+
 
 # ---------------------------------------------------------------- primitives
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def event_of(row: dict) -> dict:
+    """The event payload of a rollout line, in either persisted shape.
+
+    Legacy:  {"event_msg": {"type": "task_started", ...}}
+    Current: {"type": "event_msg", "payload": {"type": "task_started", ...}}
+    """
+    ev = row.get("event_msg")
+    if isinstance(ev, dict):
+        return ev
+    if row.get("type") == "event_msg":
+        pl = row.get("payload")
+        if isinstance(pl, dict):
+            return pl
+    return {}
+
+
+def event_type(row: dict) -> str | None:
+    t = event_of(row).get("type")
+    return t if isinstance(t, str) else None
+
+
+def state_payload(row: dict) -> dict:
+    """The dict that carries tool-call / message state, in either shape.
+
+    Current rollouts put response items in ``payload`` directly; some writers
+    wrap completed items as ``{"type":"item_completed","item":{...}}``.
+    """
+    pl = row.get("payload")
+    if not isinstance(pl, dict):
+        return {}
+    if pl.get("type") == "item_completed":
+        item = pl.get("item")
+        return item if isinstance(item, dict) else {}
+    return pl
+
+
+def user_messages(rows: list[dict]):
+    """Yield (row_index, text) for user messages in any persisted shape:
+    legacy input_text, response_item message content, or item_completed
+    UserMessage items."""
+    for i, row in enumerate(rows):
+        pl = row.get("payload") or {}
+        if pl.get("type") == "message" and pl.get("role") == "user":
+            text = pl.get("input_text")
+            if isinstance(text, str):
+                yield i, text
+                continue
+            content = pl.get("content")
+            if isinstance(content, list):
+                parts: list[str] = []
+                for c in content:
+                    if isinstance(c, dict):
+                        t = c.get("text")
+                        if isinstance(t, str):
+                            parts.append(t)
+                if parts:
+                    yield i, "".join(parts)
+        elif pl.get("type") == "item_completed":
+            item = pl.get("item")
+            if isinstance(item, dict) and str(item.get("type", "")).lower() == "usermessage":
+                parts: list[str] = []
+                for c in item.get("content") or []:
+                    if isinstance(c, dict):
+                        t = c.get("text")
+                        if isinstance(t, str):
+                            parts.append(t)
+                if parts:
+                    yield i, "".join(parts)
 
 
 def utc_stamp() -> str:
@@ -217,6 +293,30 @@ def walk_collect(value, keys: set[str], skip_keys: set[str] | None = None) -> li
 
 # -------------------------------------------------------------- call id fix
 
+def unanswered_call_ids(rows: list[dict]) -> set[str]:
+    """Call ids with no output record, across both rollout shapes.
+
+    These are the residue of a stream that died mid-tool-call; a call with
+    neither call_id nor id cannot be listed and is reported separately as an
+    empty call id by the audit.
+    """
+    calls: set[str] = set()
+    outputs: set[str] = set()
+    for row in rows:
+        payload = state_payload(row)
+        for t in CALL_TYPES:
+            if payload.get("type") == t:
+                cid = payload.get("call_id") or payload.get("id")
+                if isinstance(cid, str) and cid:
+                    calls.add(cid)
+        for out_t in CALL_TYPES.values():
+            if payload.get("type") == out_t:
+                cid = payload.get("call_id")
+                if isinstance(cid, str) and cid:
+                    outputs.add(cid)
+    return calls - outputs
+
+
 def repair_empty_call_ids(
     rows: list[dict],
 ) -> tuple[list[dict], dict[str, int]]:
@@ -240,13 +340,13 @@ def repair_empty_call_ids(
     # OUTPUT type (the type the claims arrive as).
     claimed: dict[str, set[str]] = {v: set() for v in CALL_TYPES.values()}
     for row in rows:
-        payload = row.get("payload") or {}
+        payload = state_payload(row)
         for out_t in CALL_TYPES.values():
             if payload.get("type") == out_t and payload.get("call_id"):
                 claimed[out_t].add(payload["call_id"])
 
     for ln, row in enumerate(rows, 1):
-        payload = row.get("payload") or {}
+        payload = state_payload(row)
         rtype = payload.get("type")
         for t, out_t in CALL_TYPES.items():
             if rtype == t:
@@ -295,19 +395,15 @@ def repair_empty_call_ids(
 # --------------------------------------------------------------- compaction
 
 def is_compaction(row: dict) -> bool:
-    """Compaction records and their completion events, by type field only —
-    never by searching serialized text, so user messages can't false-positive."""
-    return (
-        row.get("type") == "compacted"
-        or (row.get("event_msg", {}).get("type") == "context_compacted")
-    )
+    """Compaction records and their completion events, across both rollout
+    shapes and by type field only — never by searching serialized text, so
+    user messages can't false-positive."""
+    return row.get("type") == "compacted" or event_type(row) == "context_compacted"
 
 
 def compaction_pair_counts(rows: list[dict]) -> tuple[int, int]:
     compacted = sum(1 for r in rows if r.get("type") == "compacted")
-    events = sum(
-        1 for r in rows if (r.get("event_msg") or {}).get("type") == "context_compacted"
-    )
+    events = sum(1 for r in rows if event_type(r) == "context_compacted")
     return compacted, events
 
 
